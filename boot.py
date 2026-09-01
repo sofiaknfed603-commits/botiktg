@@ -13,16 +13,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 # ============ КОНФИГУРАЦИЯ ============
-GITLAB_URL = "https://gitlab.com"
-PRIVATE_TOKEN = "glpat-RgsZcQsAAoZLpu1Xbzx2UmM6MQpvOjEKdTpvd3N3Yw8.01.171n3g7pl"
-PROJECT_ID = "85897480"
-
 # Telegram Bot Token
 TELEGRAM_TOKEN = "8940213656:AAEHr3mf-9tmrPNHs56gu4e8T90ojpps85A"
-
-# ПУТЬ К ФАЙЛУ В РЕПОЗИТОРИИ
-FILE_PATH = ".gitlab/service_desk_templates/new_participant.md"
-BRANCH = "main"
 
 # Размер пачки (фиксированный)
 BATCH_SIZE = 10
@@ -58,7 +50,7 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        # Таблица пользователей (белый список)
+        # Таблица пользователей
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -67,6 +59,11 @@ class Database:
                 last_name TEXT,
                 is_admin BOOLEAN DEFAULT 0,
                 is_active BOOLEAN DEFAULT 1,
+                gitlab_url TEXT DEFAULT 'https://gitlab.com',
+                private_token TEXT,
+                project_id TEXT,
+                file_path TEXT DEFAULT '.gitlab/service_desk_templates/new_participant.md',
+                branch TEXT DEFAULT 'main',
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -107,6 +104,65 @@ class Database:
         conn.commit()
         conn.close()
         logger.info("База данных инициализирована")
+    
+    def get_user_settings(self, user_id):
+        """Получить настройки пользователя"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT gitlab_url, private_token, project_id, file_path, branch
+            FROM users WHERE user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return {
+                'gitlab_url': result[0] or 'https://gitlab.com',
+                'private_token': result[1],
+                'project_id': result[2],
+                'file_path': result[3] or '.gitlab/service_desk_templates/new_participant.md',
+                'branch': result[4] or 'main'
+            }
+        return None
+    
+    def update_user_settings(self, user_id, gitlab_url=None, private_token=None, 
+                            project_id=None, file_path=None, branch=None):
+        """Обновить настройки пользователя"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            updates = []
+            params = []
+            
+            if gitlab_url is not None:
+                updates.append("gitlab_url = ?")
+                params.append(gitlab_url)
+            if private_token is not None:
+                updates.append("private_token = ?")
+                params.append(private_token)
+            if project_id is not None:
+                updates.append("project_id = ?")
+                params.append(project_id)
+            if file_path is not None:
+                updates.append("file_path = ?")
+                params.append(file_path)
+            if branch is not None:
+                updates.append("branch = ?")
+                params.append(branch)
+            
+            if updates:
+                params.append(user_id)
+                query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
+                cursor.execute(query, params)
+                conn.commit()
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка обновления настроек: {e}")
+            return False
+        finally:
+            conn.close()
     
     def is_user_allowed(self, user_id):
         """Проверить, есть ли пользователь в белом списке"""
@@ -214,33 +270,45 @@ class Database:
         finally:
             conn.close()
     
-    def get_stats(self):
-        """Получить общую статистику"""
+    def get_stats(self, user_id=None):
+        """Получить статистику"""
         conn = self.get_connection()
         cursor = conn.cursor()
         stats = {}
         
-        # Общее количество пользователей
-        cursor.execute('SELECT COUNT(*) FROM users WHERE is_active = 1')
-        stats['total_users'] = cursor.fetchone()[0]
-        
-        # Количество администраторов
-        cursor.execute('SELECT COUNT(*) FROM users WHERE is_admin = 1 AND is_active = 1')
-        stats['total_admins'] = cursor.fetchone()[0]
-        
-        # Общее количество использований
-        cursor.execute('SELECT COUNT(*) FROM usage_stats')
-        stats['total_commands'] = cursor.fetchone()[0]
-        
-        # Общее количество обработанных email
-        cursor.execute('SELECT SUM(emails_count) FROM usage_stats')
-        total_emails = cursor.fetchone()[0]
-        stats['total_emails'] = total_emails if total_emails else 0
-        
-        # Количество созданных Issues
-        cursor.execute('SELECT SUM(issues_created) FROM usage_stats')
-        total_issues = cursor.fetchone()[0]
-        stats['total_issues'] = total_issues if total_issues else 0
+        if user_id:
+            # Статистика конкретного пользователя
+            cursor.execute('SELECT COUNT(*) FROM users WHERE user_id = ? AND is_active = 1', (user_id,))
+            stats['is_active'] = cursor.fetchone()[0] > 0
+            
+            cursor.execute('SELECT COUNT(*) FROM usage_stats WHERE user_id = ?', (user_id,))
+            stats['total_commands'] = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT SUM(emails_count) FROM usage_stats WHERE user_id = ?', (user_id,))
+            total_emails = cursor.fetchone()[0]
+            stats['total_emails'] = total_emails if total_emails else 0
+            
+            cursor.execute('SELECT SUM(issues_created) FROM usage_stats WHERE user_id = ?', (user_id,))
+            total_issues = cursor.fetchone()[0]
+            stats['total_issues'] = total_issues if total_issues else 0
+        else:
+            # Общая статистика
+            cursor.execute('SELECT COUNT(*) FROM users WHERE is_active = 1')
+            stats['total_users'] = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM users WHERE is_admin = 1 AND is_active = 1')
+            stats['total_admins'] = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM usage_stats')
+            stats['total_commands'] = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT SUM(emails_count) FROM usage_stats')
+            total_emails = cursor.fetchone()[0]
+            stats['total_emails'] = total_emails if total_emails else 0
+            
+            cursor.execute('SELECT SUM(issues_created) FROM usage_stats')
+            total_issues = cursor.fetchone()[0]
+            stats['total_issues'] = total_issues if total_issues else 0
         
         conn.close()
         return stats
@@ -260,11 +328,15 @@ def parse_emails(email_input):
             emails.append(email)
     return emails
 
-def create_issue(title, description=""):
-    """Создание нового Issue"""
-    url = f"{GITLAB_URL}/api/v4/projects/{PROJECT_ID}/issues"
+def create_issue(user_id, title, description=""):
+    """Создание нового Issue с настройками пользователя"""
+    settings = db.get_user_settings(user_id)
+    if not settings or not settings['private_token'] or not settings['project_id']:
+        return False, None, "Настройки GitLab не заполнены. Используйте /settings"
+    
+    url = f"{settings['gitlab_url']}/api/v4/projects/{settings['project_id']}/issues"
     headers = {
-        "PRIVATE-TOKEN": PRIVATE_TOKEN,
+        "PRIVATE-TOKEN": settings['private_token'],
         "Content-Type": "application/json"
     }
     data = {
@@ -280,15 +352,20 @@ def create_issue(title, description=""):
         issue_url = issue_data.get("web_url")
         return True, issue_id, issue_url
     except Exception as e:
+        logger.error(f"Ошибка создания Issue: {e}")
         return False, None, str(e)
 
-def add_single_email_to_issue(issue_id, email, delay=0.3):
+def add_single_email_to_issue(user_id, issue_id, email, delay=0.3):
     """Добавление одного email через команду /add_email"""
+    settings = db.get_user_settings(user_id)
+    if not settings or not settings['private_token'] or not settings['project_id']:
+        return False, "Настройки GitLab не заполнены"
+    
     comment = f"/add_email {email}"
     
-    url = f"{GITLAB_URL}/api/v4/projects/{PROJECT_ID}/issues/{issue_id}/notes"
+    url = f"{settings['gitlab_url']}/api/v4/projects/{settings['project_id']}/issues/{issue_id}/notes"
     headers = {
-        "PRIVATE-TOKEN": PRIVATE_TOKEN,
+        "PRIVATE-TOKEN": settings['private_token'],
         "Content-Type": "application/json"
     }
     data = {
@@ -303,8 +380,12 @@ def add_single_email_to_issue(issue_id, email, delay=0.3):
     except Exception as e:
         return False, f"❌ {email} - {str(e)[:50]}"
 
-def process_emails_in_batches(emails, batch_size=BATCH_SIZE, issue_name="New action"):
+def process_emails_in_batches(user_id, emails, batch_size=BATCH_SIZE, issue_name="New action"):
     """Обработка email пачками с кастомным именем Issue"""
+    settings = db.get_user_settings(user_id)
+    if not settings or not settings['private_token'] or not settings['project_id']:
+        return [], 0, 0, "Настройки GitLab не заполнены. Используйте /settings"
+    
     total_emails = len(emails)
     batches = [emails[i:i+batch_size] for i in range(0, total_emails, batch_size)]
     
@@ -315,7 +396,7 @@ def process_emails_in_batches(emails, batch_size=BATCH_SIZE, issue_name="New act
     for batch_num, batch in enumerate(batches, 1):
         issue_title = f"{issue_name} #{batch_num}"
         
-        success, issue_id, issue_url = create_issue(issue_title)
+        success, issue_id, issue_url = create_issue(user_id, issue_title)
         
         if not success:
             results.append({
@@ -327,7 +408,7 @@ def process_emails_in_batches(emails, batch_size=BATCH_SIZE, issue_name="New act
         
         batch_results = []
         for email in batch:
-            success, message = add_single_email_to_issue(issue_id, email)
+            success, message = add_single_email_to_issue(user_id, issue_id, email)
             batch_results.append({
                 "email": email,
                 "success": success,
@@ -351,19 +432,26 @@ def process_emails_in_batches(emails, batch_size=BATCH_SIZE, issue_name="New act
         if batch_num < len(batches):
             time.sleep(2)
     
-    return results, total_success, total_errors
+    return results, total_success, total_errors, None
 
 def encode_file_path(file_path):
     """Кодирование пути файла для URL"""
     return quote(file_path, safe='')
 
-def get_file_content(file_path=FILE_PATH, branch=BRANCH):
+def get_file_content(user_id, file_path=None, branch=None):
     """Получить содержимое файла из репозитория"""
+    settings = db.get_user_settings(user_id)
+    if not settings or not settings['private_token'] or not settings['project_id']:
+        return None, "Настройки GitLab не заполнены. Используйте /settings"
+    
+    file_path = file_path or settings['file_path']
+    branch = branch or settings['branch']
+    
     encoded_path = encode_file_path(file_path)
-    url = f"{GITLAB_URL}/api/v4/projects/{PROJECT_ID}/repository/files/{encoded_path}"
+    url = f"{settings['gitlab_url']}/api/v4/projects/{settings['project_id']}/repository/files/{encoded_path}"
     params = {
         "ref": branch,
-        "private_token": PRIVATE_TOKEN
+        "private_token": settings['private_token']
     }
     
     try:
@@ -380,12 +468,19 @@ def get_file_content(file_path=FILE_PATH, branch=BRANCH):
         logger.error(f"Ошибка при чтении файла: {e}")
         return None, str(e)
 
-def update_file_content(new_content, file_path=FILE_PATH, branch=BRANCH, commit_message="Обновление файла через Telegram бота"):
+def update_file_content(user_id, new_content, file_path=None, branch=None, commit_message="Обновление файла через Telegram бота"):
     """Обновить содержимое файла в репозитории"""
+    settings = db.get_user_settings(user_id)
+    if not settings or not settings['private_token'] or not settings['project_id']:
+        return False, "Настройки GitLab не заполнены. Используйте /settings"
+    
+    file_path = file_path or settings['file_path']
+    branch = branch or settings['branch']
+    
     encoded_path = encode_file_path(file_path)
-    url = f"{GITLAB_URL}/api/v4/projects/{PROJECT_ID}/repository/files/{encoded_path}"
+    url = f"{settings['gitlab_url']}/api/v4/projects/{settings['project_id']}/repository/files/{encoded_path}"
     headers = {
-        "PRIVATE-TOKEN": PRIVATE_TOKEN,
+        "PRIVATE-TOKEN": settings['private_token'],
         "Content-Type": "application/json"
     }
     
@@ -453,7 +548,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Проверяем доступ пользователя
     if not db.is_user_allowed(user_id):
-        # Проверяем, является ли пользователь администратором
         if user_id in ADMIN_IDS:
             db.add_user(user_id, user.username, user.first_name, user.last_name)
             db.log_action(user_id, "start", "Администратор запустил бота")
@@ -471,16 +565,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.log_action(user_id, "start", "Пользователь запустил бота")
         is_admin = db.is_admin(user_id)
     
+    settings = db.get_user_settings(user_id)
+    has_settings = settings and settings['private_token'] and settings['project_id']
+    
     welcome_text = (
         "🤖 GitLab Issue Creator Bot\n\n"
-        "Я помогу вам:\n"
-        "1. Создавать Issues и добавлять пользователей пачками по 10 email\n"
-        "2. Редактировать файл в репозитории\n\n"
-        f"📁 Текущий файл: {FILE_PATH}\n"
-        f"🌿 Ветка: {BRANCH}\n\n"
-        "📌 Команды:\n"
+        "Я помогу вам создавать Issues в GitLab и управлять файлами.\n\n"
+        f"📊 Статус настроек: {'✅ Настроен' if has_settings else '❌ Требуется настройка'}\n"
+    )
+    
+    if has_settings:
+        welcome_text += (
+            f"🔗 GitLab: {settings['gitlab_url']}\n"
+            f"📁 Проект: {settings['project_id']}\n"
+            f"📄 Файл: {settings['file_path']}\n"
+        )
+    
+    welcome_text += (
+        "\n📌 Команды:\n"
         "/start - Показать это сообщение\n"
         "/help - Помощь\n"
+        "/settings - Настроить GitLab\n"
         "/file - Показать содержимое файла\n"
         "/edit - Редактировать файл\n"
         "/cancel - Отменить текущую операцию"
@@ -494,11 +599,127 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(welcome_text)
 
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройка GitLab"""
+    user_id = update.effective_user.id
+    
+    if not db.is_user_allowed(user_id):
+        await update.message.reply_text("❌ У вас нет доступа к этому боту.")
+        return
+    
+    settings = db.get_user_settings(user_id)
+    
+    keyboard = [
+        [InlineKeyboardButton("🔧 GitLab URL", callback_data="settings_url")],
+        [InlineKeyboardButton("🔑 Private Token", callback_data="settings_token")],
+        [InlineKeyboardButton("📁 Project ID", callback_data="settings_project")],
+        [InlineKeyboardButton("📄 File Path", callback_data="settings_file")],
+        [InlineKeyboardButton("🌿 Branch", callback_data="settings_branch")],
+        [InlineKeyboardButton("📊 Показать настройки", callback_data="settings_show")],
+        [InlineKeyboardButton("❌ Закрыть", callback_data="settings_close")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = "⚙️ НАСТРОЙКИ GITLAB\n\n"
+    if settings:
+        text += f"🔗 URL: {settings['gitlab_url']}\n"
+        text += f"🔑 Token: {'✅ Установлен' if settings['private_token'] else '❌ Не установлен'}\n"
+        text += f"📁 Project ID: {settings['project_id'] or '❌ Не установлен'}\n"
+        text += f"📄 File Path: {settings['file_path']}\n"
+        text += f"🌿 Branch: {settings['branch']}\n"
+    else:
+        text += "Настройки не найдены.\n"
+    
+    text += "\nВыберите параметр для настройки:"
+    
+    await update.message.reply_text(text, reply_markup=reply_markup)
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка callback кнопок настроек"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data == "settings_close":
+        await query.edit_message_text("Настройки закрыты.")
+        return
+    
+    elif data == "settings_show":
+        settings = db.get_user_settings(user_id)
+        text = "📊 ТЕКУЩИЕ НАСТРОЙКИ:\n\n"
+        if settings:
+            text += f"🔗 GitLab URL: {settings['gitlab_url']}\n"
+            text += f"🔑 Private Token: {'✅ Установлен' if settings['private_token'] else '❌ Не установлен'}\n"
+            text += f"📁 Project ID: {settings['project_id'] or '❌ Не установлен'}\n"
+            text += f"📄 File Path: {settings['file_path']}\n"
+            text += f"🌿 Branch: {settings['branch']}\n"
+        else:
+            text += "Настройки не найдены."
+        await query.edit_message_text(text)
+        return
+    
+    # Сохраняем в сессию какой параметр настраиваем
+    user_sessions[user_id] = {
+        "step": "settings_input",
+        "setting": data
+    }
+    
+    setting_names = {
+        "settings_url": "GitLab URL",
+        "settings_token": "Private Token",
+        "settings_project": "Project ID",
+        "settings_file": "File Path",
+        "settings_branch": "Branch"
+    }
+    
+    await query.edit_message_text(
+        f"Введите новый {setting_names.get(data, 'параметр')}:\n\n"
+        "Отправьте значение в следующем сообщении.\n"
+        "Для отмены используйте /cancel"
+    )
+
+async def handle_settings_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ввода настроек"""
+    user_id = update.effective_user.id
+    value = update.message.text.strip()
+    
+    if user_id not in user_sessions or user_sessions[user_id].get("step") != "settings_input":
+        return
+    
+    setting = user_sessions[user_id].get("setting")
+    
+    # Обновляем настройку
+    updates = {}
+    if setting == "settings_url":
+        updates['gitlab_url'] = value
+    elif setting == "settings_token":
+        updates['private_token'] = value
+    elif setting == "settings_project":
+        updates['project_id'] = value
+    elif setting == "settings_file":
+        updates['file_path'] = value
+    elif setting == "settings_branch":
+        updates['branch'] = value
+    
+    if db.update_user_settings(user_id, **updates):
+        db.log_action(user_id, "settings_update", f"Обновлен параметр {setting}")
+        await update.message.reply_text(f"✅ Настройка успешно обновлена!")
+    else:
+        await update.message.reply_text("❌ Ошибка при обновлении настройки.")
+    
+    # Удаляем сессию
+    if user_id in user_sessions:
+        del user_sessions[user_id]
+    
+    # Показываем меню настроек
+    await settings_command(update, context)
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
     user_id = update.effective_user.id
     
-    # Проверяем доступ
     if not db.is_user_allowed(user_id):
         await update.message.reply_text(
             "❌ У вас нет доступа к этому боту.\n\n"
@@ -509,18 +730,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.log_action(user_id, "help", "Пользователь запросил помощь")
     
     help_text = (
-        "📖 Помощь\n\n"
-        "1. Добавление пользователей:\n"
+        "📖 ПОМОЩЬ\n\n"
+        "1. Настройка GitLab:\n"
+        "   Используйте /settings для настройки вашего GitLab\n"
+        "   Каждый пользователь использует свои токены и проекты\n\n"
+        "2. Добавление пользователей:\n"
         "   Отправьте список email через запятую\n"
-        "   Затем введите имя для Issues (по умолчанию 'New action')\n"
+        "   Затем введите имя для Issues\n"
         "   Email будут автоматически распределены по 10 штук в один Issue\n\n"
-        "2. Работа с файлом:\n"
-        f"   Текущий файл: {FILE_PATH}\n"
+        "3. Работа с файлом:\n"
         "   /file - показать текущее содержимое\n"
         "   /edit - начать редактирование файла\n\n"
         "⚙️ Команды:\n"
         "/start - Главное меню\n"
         "/help - Помощь\n"
+        "/settings - Настроить GitLab\n"
         "/file - Показать файл\n"
         "/edit - Редактировать файл\n"
         "/cancel - Отменить операцию"
@@ -693,30 +917,38 @@ async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db.log_action(user_id, "show_file", "Просмотр файла")
     
+    settings = db.get_user_settings(user_id)
+    if not settings or not settings['private_token'] or not settings['project_id']:
+        await update.message.reply_text(
+            "❌ Настройки GitLab не заполнены!\n"
+            "Используйте /settings для настройки."
+        )
+        return
+    
     await update.message.reply_text("Загружаю содержимое файла...")
     
-    content, error = get_file_content()
+    content, error = get_file_content(user_id)
     
     if error:
         if "не найден" in error:
             await update.message.reply_text(
-                f"Файл {FILE_PATH} не найден!\n\n"
+                f"❌ Файл {settings['file_path']} не найден!\n\n"
                 f"Проверьте:\n"
                 f"1. Правильный ли путь к файлу\n"
-                f"2. Существует ли ветка {BRANCH}\n"
+                f"2. Существует ли ветка {settings['branch']}\n"
                 f"3. Есть ли доступ к репозиторию\n\n"
-                f"Создайте файл вручную в репозитории или через веб-интерфейс GitLab."
+                f"Используйте /settings для изменения настроек."
             )
         else:
-            await update.message.reply_text(f"Ошибка при чтении файла:\n\n{error}")
+            await update.message.reply_text(f"❌ Ошибка при чтении файла:\n\n{error}")
         return
     
     if len(content) > 4000:
         content = content[:4000] + "\n\n... (файл обрезан)"
     
     await update.message.reply_text(
-        f"Содержимое файла:\n"
-        f"Файл: {FILE_PATH}\n\n"
+        f"📄 Содержимое файла:\n"
+        f"Файл: {settings['file_path']}\n\n"
         f"```\n{content}\n```",
         parse_mode='Markdown'
     )
@@ -725,21 +957,30 @@ async def show_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def edit_file_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начать редактирование файла"""
     user_id = update.effective_user.id
+    
+    settings = db.get_user_settings(user_id)
+    if not settings or not settings['private_token'] or not settings['project_id']:
+        await update.message.reply_text(
+            "❌ Настройки GitLab не заполнены!\n"
+            "Используйте /settings для настройки."
+        )
+        return
+    
     db.log_action(user_id, "edit_file_start", "Начало редактирования файла")
     
     await update.message.reply_text("Проверяю существование файла...")
     
-    content, error = get_file_content()
+    content, error = get_file_content(user_id)
     
     if error:
         if "не найден" in error:
             await update.message.reply_text(
-                f"Файл {FILE_PATH} не найден!\n\n"
-                f"Создайте файл вручную в репозитории через веб-интерфейс GitLab."
+                f"❌ Файл {settings['file_path']} не найден!\n\n"
+                f"Создайте файл вручную в репозитории или измените настройки."
             )
             return
         else:
-            await update.message.reply_text(f"Ошибка: {error}")
+            await update.message.reply_text(f"❌ Ошибка: {error}")
             return
     
     user_sessions[user_id] = {
@@ -748,7 +989,7 @@ async def edit_file_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     await update.message.reply_text(
-        f"Редактирование файла {FILE_PATH}\n\n"
+        f"📝 Редактирование файла {settings['file_path']}\n\n"
         "Отправьте новый текст файла.\n"
         "Используйте Markdown для форматирования.\n\n"
         "Текущее содержимое:\n"
@@ -768,13 +1009,13 @@ async def save_file_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("Сохраняю файл...")
     
-    success, error = update_file_content(new_content)
+    success, error = update_file_content(user_id, new_content)
     
     if success:
         db.log_action(user_id, "save_file", "Файл успешно сохранен")
-        await update.message.reply_text("Файл успешно обновлен!")
+        await update.message.reply_text("✅ Файл успешно обновлен!")
     else:
-        await update.message.reply_text(f"Ошибка при сохранении:\n\n{error}")
+        await update.message.reply_text(f"❌ Ошибка при сохранении:\n\n{error}")
     
     if user_id in user_sessions:
         del user_sessions[user_id]
@@ -786,7 +1027,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if user_id in user_sessions:
         del user_sessions[user_id]
-        await update.message.reply_text("Операция отменена")
+        await update.message.reply_text("❌ Операция отменена")
     else:
         await update.message.reply_text("Нет активной операции")
 
@@ -796,15 +1037,29 @@ async def handle_emails(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
     
+    # Проверяем, не вводят ли настройки
+    if user_id in user_sessions and user_sessions[user_id].get("step") == "settings_input":
+        await handle_settings_input(update, context)
+        return
+    
     if user_id in user_sessions and user_sessions[user_id].get("step") == "editing_file":
         await save_file_edit(update, context)
+        return
+    
+    # Проверяем настройки
+    settings = db.get_user_settings(user_id)
+    if not settings or not settings['private_token'] or not settings['project_id']:
+        await update.message.reply_text(
+            "❌ Настройки GitLab не заполнены!\n"
+            "Используйте /settings для настройки перед созданием Issues."
+        )
         return
     
     emails = parse_emails(text)
     
     if not emails:
         await update.message.reply_text(
-            "Не найдено корректных email!\n"
+            "❌ Не найдено корректных email!\n"
             "Пожалуйста, отправьте email через запятую, пробел или новой строкой."
         )
         return
@@ -815,11 +1070,11 @@ async def handle_emails(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     await update.message.reply_text(
-        f"Найдено {len(emails)} email\n\n"
+        f"📧 Найдено {len(emails)} email\n\n"
         f"Введите имя для Issues (будет добавлен номер пачки)\n"
         f"Например: 'New action' или 'Задача'\n\n"
         f"Или отправьте 'default' для использования 'New action'\n\n"
-        f"Размер пачки: {BATCH_SIZE} email в один Issue"
+        f"📦 Размер пачки: {BATCH_SIZE} email в один Issue"
     )
 
 @check_access
@@ -843,7 +1098,7 @@ async def handle_issue_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_batches = len(emails) // BATCH_SIZE + (1 if len(emails) % BATCH_SIZE else 0)
     
     progress_msg = await update.message.reply_text(
-        f"Начинаю обработку...\n\n"
+        f"🔄 Начинаю обработку...\n\n"
         f"Всего email: {len(emails)}\n"
         f"Имя Issue: {issue_name}\n"
         f"Размер пачки: {BATCH_SIZE}\n"
@@ -851,19 +1106,25 @@ async def handle_issue_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Пожалуйста, подождите..."
     )
     
-    results, total_success, total_errors = process_emails_in_batches(emails, BATCH_SIZE, issue_name)
+    results, total_success, total_errors, error = process_emails_in_batches(user_id, emails, BATCH_SIZE, issue_name)
+    
+    if error:
+        await progress_msg.edit_text(f"❌ Ошибка: {error}")
+        if user_id in user_sessions:
+            del user_sessions[user_id]
+        return
     
     # Логируем использование
     db.log_usage(user_id, "process_emails", len(emails), len([r for r in results if r['status'] == 'success']))
     db.log_action(user_id, "process_emails", f"Обработано {len(emails)} email, создано {len([r for r in results if r['status'] == 'success'])} Issues")
     
-    response = "ГОТОВО!\n\n"
-    response += "СТАТИСТИКА:\n"
-    response += f"  Успешно добавлено: {total_success}\n"
-    response += f"  Ошибок: {total_errors}\n"
-    response += f"  Создано Issues: {len([r for r in results if r['status'] == 'success'])}\n\n"
+    response = "✅ ГОТОВО!\n\n"
+    response += "📊 СТАТИСТИКА:\n"
+    response += f"  ✅ Успешно добавлено: {total_success}\n"
+    response += f"  ❌ Ошибок: {total_errors}\n"
+    response += f"  📦 Создано Issues: {len([r for r in results if r['status'] == 'success'])}\n\n"
     
-    response += "Созданные Issues:\n"
+    response += "🔗 Созданные Issues:\n"
     for r in results:
         if r['status'] == 'success':
             response += f"  #{r['issue_id']}: {r['issue_title']}\n"
@@ -886,7 +1147,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in user_sessions:
         step = user_sessions[user_id].get("step")
         
-        if step == "editing_file":
+        if step == "settings_input":
+            await handle_settings_input(update, context)
+            return
+        elif step == "editing_file":
             await save_file_edit(update, context)
             return
         elif step == "awaiting_issue_name":
@@ -903,9 +1167,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
     
-    # Проверяем, является ли пользователь администратором
+    # Проверка настроек
+    if data.startswith("settings_"):
+        # Проверяем доступ
+        if not db.is_user_allowed(user_id):
+            await query.edit_message_text("❌ У вас нет доступа к этому боту.")
+            return
+        await settings_callback(update, context)
+        return
+    
+    # Админ-панель
     if not db.is_admin(user_id):
-        await query.edit_message_text("У вас нет прав администратора.")
+        await query.edit_message_text("❌ У вас нет прав администратора.")
         return
     
     if data == "admin_close":
@@ -984,10 +1257,7 @@ def main():
     print("=" * 60)
     print("  TELEGRAM GITLAB BOT")
     print("=" * 60)
-    print(f"  GitLab: {GITLAB_URL}")
-    print(f"  Project: {PROJECT_ID}")
-    print(f"  File: {FILE_PATH}")
-    print(f"  Branch: {BRANCH}")
+    print(f"  Bot Token: {TELEGRAM_TOKEN[:20]}...")
     print(f"  Batch Size: {BATCH_SIZE}")
     print(f"  Admin ID: {ADMIN_IDS[0]}")
     print("=" * 60)
@@ -996,6 +1266,7 @@ def main():
     print("   Команды:")
     print("   /start - Главное меню")
     print("   /help - Помощь")
+    print("   /settings - Настройки GitLab")
     print("   /file - Показать содержимое файла")
     print("   /edit - Редактировать файл")
     print("   /admin - Админ-панель")
@@ -1010,6 +1281,7 @@ def main():
     # Команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("file", show_file))
     application.add_handler(CommandHandler("edit", edit_file_start))
     application.add_handler(CommandHandler("admin", admin_panel))
